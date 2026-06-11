@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FSK 音響通信レシーバー</title>
+    <style>
+        body { font-family: sans-serif; text-align: center; padding: 20px; background: #f0f0f2; }
+        button { padding: 15px 30px; font-size: 18px; cursor: pointer; border-radius: 8px; border: none; background: #007aff; color: white; margin-bottom: 20px; }
+        #status { font-weight: bold; color: #555; }
+        #result { width: 80%; height: 200px; margin: 20px auto; padding: 10px; background: white; border: 1px solid #ccc; text-align: left; overflow-y: scroll; font-family: monospace; font-size: 16px; white-space: pre-wrap; }
+    </style>
+</head>
+<body>
+
+    <h1>FSK 音響通信レシーバー (300bps)</h1>
+    <button id="startBtn">受信開始（マイクを許可）</button>
+    <div id="status">停止中</div>
+    
+    <h3>受信したデータ:</h3>
+    <div id="result"></div>
+
+<script>
+const startBtn = document.getElementById('startBtn');
+const statusDiv = document.getElementById('status');
+const resultDiv = document.getElementById('result');
+
+// 通信パラメータ (マイコン側と一致させる)
+const BAUDRATE = 300;
+const BIT_DURATION = 1000 / BAUDRATE; // 1ビットあたりの時間 (約3.33ミリ秒)
+
+// 周波数判定の閾値
+const FREQ_MARK = 1200;  // ビット「1」
+const FREQ_SPACE = 2200; // ビット「0」
+
+let audioContext;
+let analyser;
+let sampleRate;
+let fftSize = 512; // 解析の細かさ（レスポンス重視で小さめに設定）
+
+startBtn.addEventListener('click', async () => {
+    try {
+        // 1. オーディオコンテキストの開始
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        sampleRate = audioContext.sampleRate;
+
+        // 2. マイクの許可を取得
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        const source = audioContext.createMediaStreamSource(stream);
+
+        // 3. アナライザーの設定
+        analyser = audioContext.createAnalyser();
+        analyser.fftSize = fftSize;
+        source.connect(analyser);
+
+        statusDiv.innerText = "受信中... マイコンから音を再生してください";
+        statusDiv.style.color = "green";
+        startBtn.style.display = "none";
+
+        // 解析ループの開始
+        startDecoding();
+
+    } catch (err) {
+        alert("マイクの起動に失敗しました。設定を確認してください: " + err);
+    }
+});
+
+// 周波数インデックスの計算
+// FFTの各ビン（箱）が何Hzを担当しているかを割り出す
+function freqToIndex(freq) {
+    return Math.round((freq * fftSize) / sampleRate);
+}
+
+function startDecoding() {
+    const bufferLength = analyser.frequencyBinCount;
+    const dataArray = new Uint8Array(bufferLength);
+    
+    const idx1200 = freqToIndex(FREQ_MARK);
+    const idx2200 = freqToIndex(FREQ_SPACE);
+
+    let isReceiving = false;
+
+    // リアルタイムに音を監視するループ (約1.5ms〜2ms周期)
+    function checkAudio() {
+        analyser.getByteFrequencyData(dataArray);
+
+        // 1200Hzと2200Hzの音量（強度）を取得
+        const val1200 = dataArray[idx1200];
+        const val2200 = dataArray[idx2200];
+
+        // 閾値を超えており、かつ2200Hz(SPACE)の方が強い ＝ スタートビット検出！
+        if (!isReceiving && val2200 > 60 && val2200 > val1200) {
+            isReceiving = true; // デコード処理中フラグを立てる
+            
+            // スタートビットの真ん中あたりまで少し待ってからサンプリングを開始する (タイミング補正)
+            setTimeout(() => {
+                readByte();
+            }, BIT_DURATION * 1.5); 
+        }
+
+        if (!isReceiving) {
+            requestAnimationFrame(checkAudio);
+        }
+    }
+
+    // 1バイト（8ビット）分のデータをタイマーベースで順次読み取る関数
+    function readByte() {
+        let bitCount = 0;
+        let receivedByte = 0;
+
+        // 3.33msごとにビットをチェックするタイマー
+        const intervalId = setInterval(() => {
+            analyser.getByteFrequencyData(dataArray);
+            const val1200 = dataArray[idx1200];
+            const val2200 = dataArray[idx2200];
+
+            let bit = 1; // デフォルトは1(MARK)
+            if (val2200 > val1200 && val2200 > 40) {
+                bit = 0; // 2200Hzの方が強ければ0(SPACE)
+            }
+
+            // LSBファースト（下位ビットから順に組み立て）
+            receivedByte |= (bit << bitCount);
+            bitCount++;
+
+            // 8ビットすべて読み終わったら終了
+            if (bitCount >= 8) {
+                clearInterval(intervalId);
+                
+                // 文字に変換して画面に表示
+                const char = String.fromCharCode(receivedByte);
+                resultDiv.innerText += char;
+                // 自動スクロール
+                resultDiv.scrollTop = resultDiv.scrollHeight;
+
+                // ストップビットの通過を待つために少し猶予を置いてから、次の待機ループへ
+                setTimeout(() => {
+                    isReceiving = false;
+                    requestAnimationFrame(checkAudio);
+                }, BIT_DURATION * 2);
+            }
+        }, BIT_DURATION);
+    }
+
+    // 監視スタート
+    requestAnimationFrame(checkAudio);
+}
+</script>
+</body>
+</html>
